@@ -1,158 +1,301 @@
-/* =====================================================================
-   APEX OMS v25 — live sync
-   Pushes this browser's changes to the OMS server (server.py) and polls for
-   other users' changes, so every open session updates by itself.
-   Without the server it falls back to this browser only (other tabs still sync).
-   ===================================================================== */
+// ======================================================
+// APEX OMS - SUPABASE REALTIME SYNC
+// ======================================================
+
 (function () {
-'use strict';
-const clone = o => JSON.parse(JSON.stringify(o));
-const strip = d => { const c = Object.assign({}, d); delete c.session; return c; };
-const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-const isObj = v => v && typeof v === 'object' && !Array.isArray(v);
-const POLL_MS = 2000;
-const FORM_ROUTES = ['new-order', 'create-company', 'new-staff', 'import-lead', 'add-return', 'product-tools', 'settings', 'commission-rate', 'announcement'];
 
-let ver = 0, base = null, online = false, dirty = false, pushing = false, pushTimer = null, pendingRender = false;
-const origSave = save;
+    "use strict";
 
-/* ---------------------------------------------------------------- diff (client) */
-function idField(arr) {
-  for (const f of ['id', 'no']) {
-    if (arr.length && arr.every(x => isObj(x) && x[f] !== undefined && x[f] !== null) && new Set(arr.map(x => x[f])).size === arr.length) return f;
-  }
-  return null;
-}
-function diff(cur, prev) {
-  const out = {};
-  for (const k of new Set([...Object.keys(cur), ...Object.keys(prev)])) {
-    const a = cur[k], b = prev[k];
-    if (a === undefined) { out[k] = { t: 'delete' }; continue; }
-    if (same(a, b)) continue;
-    if (Array.isArray(a) && Array.isArray(b)) {
-      const f = idField(a.length ? a : b);
-      if (f && (!a.length || !b.length || idField(b) === f)) {
-        const bm = new Map(b.map(x => [x[f], JSON.stringify(x)])), aset = new Set(a.map(x => x[f]));
-        out[k] = { t: 'arr', idf: f, up: a.filter(x => bm.get(x[f]) !== JSON.stringify(x)), del: b.filter(x => !aset.has(x[f])).map(x => x[f]) };
-        continue;
-      }
-    } else if (isObj(a) && isObj(b)) {
-      const set = {}, del = [];
-      for (const c of Object.keys(a)) if (!same(a[c], b[c])) set[c] = a[c];
-      for (const c of Object.keys(b)) if (!(c in a)) del.push(c);
-      out[k] = { t: 'obj', set, del };
-      continue;
+    const config = window.APEX_SUPABASE;
+
+    if (!config) {
+        console.error("Supabase configuration missing.");
+        return;
     }
-    out[k] = { t: 'replace', v: a };
-  }
-  return out;
-}
 
-/* ---------------------------------------------------------------- live badge */
-function setLive() {
-  let el = document.getElementById('liveDot');
-  if (!el) {
-    const host = document.querySelector('.top-actions'); if (!host) return;
-    el = document.createElement('div'); el.id = 'liveDot'; el.className = 'live-dot';
-    host.insertBefore(el, host.firstChild);
-  }
-  el.className = 'live-dot ' + (online ? 'on' : 'off');
-  el.innerHTML = '<i></i><span>' + (online ? 'Live' : 'Offline') + '</span>';
-  el.title = online ? 'Connected — changes from other users appear automatically' : 'OMS server not reachable — changes stay in this browser only';
-}
+    const supabase = window.supabase.createClient(
+        config.url,
+        config.anonKey
+    );
 
-/* ---------------------------------------------------------------- push */
-function schedulePush() { dirty = true; clearTimeout(pushTimer); pushTimer = setTimeout(push, 300); }
-async function push() {
-  if (pushing) { pushTimer = setTimeout(push, 300); return; }
-  pushing = true;
-  const snapshot = clone(strip(db)), v0 = ver;
-  try {
-    let body;
-    if (base === null) body = { full: snapshot };
-    else {
-      const changes = diff(snapshot, base);
-      if (!Object.keys(changes).length) { dirty = false; return; }
-      body = { changes };
+    const TABLE = config.table || "oms_state";
+    const ROW_ID = config.rowId || "main";
+
+    let isRemoteUpdate = false;
+    let isSaving = false;
+    let syncTimer = null;
+    let lastUpdated = null;
+
+    // --------------------------------------------------
+    // Preserve existing OMS save function
+    // --------------------------------------------------
+
+    const originalSave = window.save;
+
+    if (typeof originalSave !== "function") {
+        console.error("OMS save() function not found.");
+        return;
     }
-    const r = await fetch('/api/state', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    if (!r.ok) throw new Error('http ' + r.status);
-    const j = await r.json(); online = true; setLive();
-    if (j.rejected) { dirty = false; base = null; pushing = false; return pull(true); }
-    base = snapshot; ver = j.version; dirty = false;
-    if (j.prev !== v0) { pushing = false; return pull(true); }   // somebody else changed data in between
-  } catch (e) { online = false; setLive(); }
-  finally { pushing = false; }
-}
 
-/* ---------------------------------------------------------------- pull */
-async function pull(force) {
-  if (pushing || dirty) return;
-  try {
-    const r = await fetch('/api/state?since=' + (force ? -1 : ver), { cache: 'no-store' });
-    if (!r.ok) throw new Error('http ' + r.status);
-    const j = await r.json(); online = true; setLive();
-    if (!j.db && j.changed !== false) { if (base === null && db.session !== undefined) { dirty = true; push(); } return; }   // empty server: seed it from this browser
-    if (j.changed === false) return;
-    apply(j);
-  } catch (e) { online = false; setLive(); }
-}
-function sessionOk() {
-  const s = db.session; if (!s || s.role === 'Owner') return true;
-  const u = db.staff.find(x => x.id === s.staffId); if (!u) return false;
-  const c = db.companies.find(x => x.id === u.companyId); return !!c && c.active !== false;
-}
-function apply(j) {
-  const session = db.session;
-  db = Object.assign({}, j.db, { session: session === undefined ? null : session });
-  ver = j.version; base = clone(j.db);
-  origSave();
-  if (!sessionOk()) { db.session = null; origSave(); loginScreen(); toast('Your account was changed or blocked. Please sign in again.'); return; }
-  if (db.session) { pendingRender = true; tryRender(); }
-}
+    // --------------------------------------------------
+    // Prepare data for cloud
+    // --------------------------------------------------
 
-/* ---------------------------------------------------------------- re-render without losing the user's place */
-function canRender() {
-  if ([...document.querySelectorAll('.modal-mask,.modal-backdrop')].some(m => getComputedStyle(m).display !== 'none')) return false;
-  const a = document.activeElement, c = document.getElementById('content');
-  if (a && c && c.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && !/^(checkbox|radio|button|submit)$/.test(a.type)) return false;
-  if (c && c.querySelector('.form-grid')) return false;
-  if (c && [...c.querySelectorAll('input[type=file]')].some(i => i.files && i.files.length)) return false;
-  const route = location.hash.slice(1) || 'dashboard';
-  if (FORM_ROUTES.includes(route) || route.startsWith('waybill')) return false;
-  return true;
-}
-function tryRender() {
-  if (!pendingRender || !db.session || !canRender()) return;
-  pendingRender = false;
-  const c = document.getElementById('content');
-  const snap = [...document.querySelectorAll('#content [id]')].filter(e => /^(INPUT|SELECT|TEXTAREA)$/.test(e.tagName) && !/^(file|password)$/.test(e.type)).map(e => [e.id, e.value, e.checked]);
-  const y = window.scrollY, cy = c ? c.scrollTop : 0;
-  try { render(); } catch (e) { console.error(e); }
-  snap.forEach(([id, v, chk]) => {
-    const e = document.getElementById(id); if (!e || !c.contains(e)) return;
-    if (e.value !== v || e.checked !== chk) {
-      if (e.type === 'checkbox' || e.type === 'radio') e.checked = chk; else e.value = v;
-      e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true }));
+    function getCloudState() {
+
+        const state = JSON.parse(
+            JSON.stringify(window.db)
+        );
+
+        // Keep local login session private
+        delete state.session;
+
+        return state;
     }
-  });
-  window.scrollTo(0, y); if (c) c.scrollTop = cy;
-}
 
-/* ---------------------------------------------------------------- wiring */
-save = function () { origSave(); schedulePush(); };
-window.save = save;
+    // --------------------------------------------------
+    // SAVE TO SUPABASE
+    // --------------------------------------------------
 
-// No server (file:// or server stopped): keep other tabs of this browser in sync
-window.addEventListener('storage', e => {
-  if (online || e.key !== KEY || !e.newValue) return;
-  try { db = JSON.parse(e.newValue); pendingRender = true; tryRender(); } catch (err) { /* ignore */ }
-});
+    async function saveToSupabase() {
 
-setLive();
-pull(true);
-setInterval(() => { pull(false); tryRender(); }, POLL_MS);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) pull(false); });
-window.addEventListener('focus', () => pull(false));
-window.apexSyncStatus = () => ({ online, ver, dirty });
+        if (isSaving || isRemoteUpdate) {
+            return;
+        }
+
+        isSaving = true;
+
+        try {
+
+            const cloudState = getCloudState();
+
+            const { data, error } = await supabase
+                .from(TABLE)
+                .upsert({
+                    id: ROW_ID,
+                    state: cloudState,
+                    updated_at: new Date().toISOString()
+                }, {
+                    onConflict: "id"
+                })
+                .select()
+                .single();
+
+            if (error) {
+                throw error;
+            }
+
+            lastUpdated = data.updated_at;
+
+            console.log("OMS saved to Supabase.");
+
+        } catch (error) {
+
+            console.error(
+                "Supabase save error:",
+                error
+            );
+
+        } finally {
+
+            isSaving = false;
+
+        }
+
+    }
+
+    // --------------------------------------------------
+    // Override existing save()
+    // --------------------------------------------------
+
+    window.save = function () {
+
+        originalSave.apply(this, arguments);
+
+        if (isRemoteUpdate) {
+            return;
+        }
+
+        clearTimeout(syncTimer);
+
+        syncTimer = setTimeout(function () {
+            saveToSupabase();
+        }, 500);
+
+    };
+
+    // --------------------------------------------------
+    // LOAD INITIAL DATA
+    // --------------------------------------------------
+
+    async function loadFromSupabase() {
+
+        try {
+
+            const { data, error } = await supabase
+                .from(TABLE)
+                .select("state, updated_at")
+                .eq("id", ROW_ID)
+                .maybeSingle();
+
+            if (error) {
+                throw error;
+            }
+
+            if (!data) {
+
+                console.log(
+                    "No OMS cloud data found. Uploading local data."
+                );
+
+                await saveToSupabase();
+
+                return;
+            }
+
+            lastUpdated = data.updated_at;
+
+            applyRemoteState(data.state);
+
+            console.log("OMS cloud data loaded.");
+
+        } catch (error) {
+
+            console.error(
+                "Supabase initial load error:",
+                error
+            );
+
+        }
+
+    }
+
+    // --------------------------------------------------
+    // APPLY REMOTE STATE
+    // --------------------------------------------------
+
+    function applyRemoteState(remoteState) {
+
+        if (!remoteState) {
+            return;
+        }
+
+        isRemoteUpdate = true;
+
+        try {
+
+            // Keep current browser login session
+            const currentSession = window.db.session;
+
+            window.db = Object.assign(
+                {},
+                remoteState,
+                {
+                    session: currentSession
+                }
+            );
+
+            // Save locally without triggering cloud upload
+            originalSave();
+
+            // Refresh current OMS page
+            if (typeof window.render === "function") {
+                window.render();
+            }
+
+        } catch (error) {
+
+            console.error(
+                "Remote state application error:",
+                error
+            );
+
+        } finally {
+
+            isRemoteUpdate = false;
+
+        }
+
+    }
+
+    // --------------------------------------------------
+    // REALTIME SUBSCRIPTION
+    // --------------------------------------------------
+
+    function startRealtime() {
+
+        supabase
+            .channel("apex-oms-realtime")
+
+            .on(
+                "postgres_changes",
+                {
+                    event: "*",
+                    schema: "public",
+                    table: TABLE,
+                    filter: "id=eq." + ROW_ID
+                },
+
+                function (payload) {
+
+                    console.log(
+                        "Supabase realtime event:",
+                        payload.eventType
+                    );
+
+                    if (
+                        payload.eventType === "INSERT" ||
+                        payload.eventType === "UPDATE"
+                    ) {
+
+                        const remoteState =
+                            payload.new.state;
+
+                        const remoteUpdated =
+                            payload.new.updated_at;
+
+                        if (
+                            remoteUpdated === lastUpdated
+                        ) {
+                            return;
+                        }
+
+                        lastUpdated = remoteUpdated;
+
+                        applyRemoteState(remoteState);
+
+                    }
+
+                }
+            )
+
+            .subscribe(function (status) {
+
+                console.log(
+                    "Supabase Realtime:",
+                    status
+                );
+
+            });
+
+    }
+
+    // --------------------------------------------------
+    // INITIALIZE
+    // --------------------------------------------------
+
+    async function initializeOMS() {
+
+        console.log(
+            "Connecting APEX OMS to Supabase..."
+        );
+
+        await loadFromSupabase();
+
+        startRealtime();
+
+    }
+
+    initializeOMS();
+
 })();

@@ -1,0 +1,12 @@
+// supabase-config.js
+
+window.APEX_SUPABASE = {
+    url: "https://pluhgouxfrszzekbxbxh.supabase.co/rest/v1/",
+
+    // Supabase publishable key / anon public key
+    anonKey: "sb_publishable_LktAUSCU_vTgORCsh7Bxcg_zduXaMdF",
+
+    table: "oms_state",
+
+    rowId: "main"
+};

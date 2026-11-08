@@ -3947,3 +3947,15 @@ window.saveLeadNotePopup=function(no){
   };
   pages.dashboard=dashboard;
 })();
+// Expose existing OMS database state safely
+Object.defineProperty(window, "db", {
+
+    get: function () {
+        return db;
+    },
+
+    set: function (value) {
+        db = value;
+    }
+
+});
